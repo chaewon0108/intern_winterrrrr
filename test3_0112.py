@@ -36,73 +36,82 @@ from src.faceinsight.engine.postprocessor.emotion_calibration_utils import get_d
 
 def custom_batch_make(self, frame, detected_face, *args, **kwargs):
     """
-    batch mask 할 때 사진 저장을 위해 추가된 함수..,,
-    face 0 일때의 img만 저장하도록 했음!
+    모든 detected face에 대해 사진을 저장하도록 수정됨.
+    if i == 0 조건을 제거하여 모든 i(얼굴 인덱스)에 대해 저장 로직이 돕니다.
     """
 
-    SAVE_DEBUG_DIR = "/home/technonia/intern/faceinsight/0115_padding_test" #경로 설정 조심
+    SAVE_DEBUG_DIR = "/home/technonia/intern/faceinsight/close_img_faces" 
     if not os.path.exists(SAVE_DEBUG_DIR):
         os.makedirs(SAVE_DEBUG_DIR)
 
-    current_fname = getattr(self, "current_filename", "unknown")
+    raw_fname = getattr(self, "current_filename", "unknown")
+    current_fname = os.path.basename(raw_fname) # 경로 제거
+    if "." in current_fname: 
+        current_fname = os.path.splitext(current_fname)[0] # 확장자 제거
 
     transform = Compose([Grayscale(3)])
     gray = transform(frame)
+
+    if not detected_face:
+        return None
 
     len_index = [len(aa) for aa in detected_face]
     length_cumu = np.cumsum(len_index)
     flat_faces = [item for sublist in detected_face for item in sublist]
 
     concat_batch = None
+    
     for i, face in enumerate(flat_faces):
         frame_choice = np.where(i < length_cumu)[0][0]
         bbox = BBox(face[:-1])
-        face = (
+        
+        face_tensor = (
             bbox.expand_by_factor(1.1)
             .extract_from_image(gray[frame_choice])
             .unsqueeze(0)
         )
 
-        if i == 0: #face 0 번 일때만
-            try:
-                face_cpu = face.clone().cpu()
-                
-                # 차원 정리 (B, C, W, H) -> (C, W, H)
-                if face_cpu.dim() == 4: 
-                    face_cpu = face_cpu.squeeze(0)
-                
-                # (C, W, H) -> (W, H, C)
-                if face_cpu.dim() == 3:
-                    face_permuted = face_cpu.permute(1, 2, 0)
-                    face_np = face_permuted.numpy()
-                elif face_cpu.dim() == 2:
-                    face_np = face_cpu.numpy()
+        try:
+            face_cpu = face_tensor.clone().cpu()
+            
+            # 차원 정리 (B, C, W, H) -> (C, W, H)
+            if face_cpu.dim() == 4: 
+                face_cpu = face_cpu.squeeze(0)
+            
+            # (C, W, H) -> (W, H, C)
+            if face_cpu.dim() == 3:
+                face_permuted = face_cpu.permute(1, 2, 0)
+                face_np = face_permuted.numpy()
+            elif face_cpu.dim() == 2:
+                face_np = face_cpu.numpy()
+            else:
+                face_np = None
+
+            if face_np is not None and face_np.size > 0:
+                if face_np.max() <= 1.0:
+                    face_np = (face_np * 255).astype(np.uint8)
                 else:
-                    face_np = None
+                    face_np = face_np.astype(np.uint8)
 
-                if face_np is not None and face_np.size > 0:
-                    if face_np.max() <= 1.0:
-                        face_np = (face_np * 255).astype(np.uint8)
-                    else:
-                        face_np = face_np.astype(np.uint8)
-
-                    save_name = f"{current_fname}_debug_resmasknet_face_{i}.png"
-                    save_path = os.path.join(SAVE_DEBUG_DIR, save_name)
+                save_name = f"{current_fname}_face{i}.png"
+                save_path = os.path.join(SAVE_DEBUG_DIR, save_name)
+                
+                if face_np.ndim == 3 and face_np.shape[2] == 3:
+                    cv2.imwrite(save_path, face_np[:, :, ::-1]) 
+                else:
+                    cv2.imwrite(save_path, face_np)
                     
-                    if face_np.ndim == 3 and face_np.shape[2] == 3:
-                        cv2.imwrite(save_path, face_np[:, :, ::-1]) 
-                    else:
-                        cv2.imwrite(save_path, face_np)
-                        
-            except Exception as e:
-                pass
+        except Exception as e:
+            print(f"저장 실패: {e}") # 필요시 주석 해제
+            pass
 
-        transform = Resize(self.image_size) #tensor 병합
-        face = transform(face) / 255
+        # 텐서 병합 (모델 입력용)
+        transform_resize = Resize(self.image_size)
+        face_tensor = transform_resize(face_tensor) / 255
         if concat_batch is None:
-            concat_batch = face
+            concat_batch = face_tensor
         else:
-            concat_batch = torch.cat((concat_batch, face), 0)
+            concat_batch = torch.cat((concat_batch, face_tensor), 0)
 
     return concat_batch
 
@@ -200,9 +209,9 @@ def run_csv_analysis(csv_path, image_base_path, chain, emotion_classes):
                     # })
 
                     # analysis_res[f"face"] = actual_faces[0] #이게 confidence 제일 높으니까 이것만 일단 사용
-                    # if len(actual_faces) > 0:
-                    #     for i in range(len(actual_faces)): #얼굴 개수만큼 반복 (actual_faces)
-                    #         analysis_res[f"face_{i}"] = actual_faces[i]
+                    if len(actual_faces) > 0:
+                        for i in range(len(actual_faces)): #얼굴 개수만큼 반복 (actual_faces)
+                            analysis_res[f"face_{i}"] = actual_faces[i]
                     
 
                     # 중심점끼리 var, mean 비교
@@ -254,9 +263,9 @@ def run_csv_analysis(csv_path, image_base_path, chain, emotion_classes):
     return pd.DataFrame(results_data)
 
 if __name__ == "__main__":
-    IMAGE_BASE_PATH = "/home/technonia/intern/faceinsight/validation_csv_img" #이 폴더가 True + empty0인 사진만 있는 폴더
-    INPUT_CSV_PATH = "/home/technonia/intern/faceinsight/validation_0113.csv" #validation_0113.csv가 detect True + empty 0만 담아둔 csv
-    OUTPUT_CSV_PATH = "0115_affectnet_result_1.5.csv"
+    IMAGE_BASE_PATH = "/home/technonia/intern/faceinsight/close_img_0115" #이 폴더가 True + empty0인 사진만 있는 폴더
+    INPUT_CSV_PATH = "/home/technonia/intern/faceinsight/validation_close_img_0115.csv" #validation_0113.csv가 detect True + empty 0만 담아둔 csv
+    OUTPUT_CSV_PATH = "0115_affectnet_result_big_img_test.csv"
 
     chain = ValenceArousalImageChain()
     emotion_classes = chain.au_agent.emotion_labels
