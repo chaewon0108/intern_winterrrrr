@@ -1,0 +1,230 @@
+# dmaps 영상에서 캡쳐 이미지 crop한 거 쓸 떄
+
+import os
+import cv2
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import torch
+import types
+from torchvision.transforms import Compose, Grayscale, Resize
+from feat.utils.image_operations import BBox
+from src.faceinsight.engine.chain.val_aro_image_chain import ValenceArousalImageChain
+from src.faceinsight.engine.postprocessor.emotion_calibration_utils import get_dominant_emotion
+
+# ==========================================
+# 1. 커스텀 배치 생성 함수 (Face Crop 저장용)
+# ==========================================
+def custom_batch_make(self, frame, detected_face, *args, **kwargs):
+    """
+    detect된 얼굴 영역을 crop해서 지정된 폴더에 저장
+    """
+    # [설정] 크롭된 얼굴 이미지를 저장할 경로
+    SAVE_DEBUG_DIR = "/home/technonia/intern/data_img_crop"
+    
+    if not os.path.exists(SAVE_DEBUG_DIR):
+        os.makedirs(SAVE_DEBUG_DIR)
+
+    raw_fname = getattr(self, "current_filename", "unknown")
+    current_fname = os.path.basename(raw_fname)
+    if "." in current_fname: 
+        current_fname = os.path.splitext(current_fname)[0]
+
+    transform = Compose([Grayscale(3)])
+    gray = transform(frame)
+
+    if not detected_face:
+        return None
+
+    len_index = [len(aa) for aa in detected_face]
+    length_cumu = np.cumsum(len_index)
+    flat_faces = [item for sublist in detected_face for item in sublist]
+
+    concat_batch = None
+    
+    for i, face in enumerate(flat_faces):
+        try:
+            frame_choice = np.where(i < length_cumu)[0][0]
+            bbox = BBox(face[:-1])
+            
+            face_tensor = (
+                bbox.expand_by_factor(1.1)
+                .extract_from_image(gray[frame_choice])
+                .unsqueeze(0)
+            )
+
+            face_cpu = face_tensor.clone().cpu()
+            if face_cpu.dim() == 4: face_cpu = face_cpu.squeeze(0)
+            
+            if face_cpu.dim() == 3:
+                face_permuted = face_cpu.permute(1, 2, 0)
+                face_np = face_permuted.numpy()
+            elif face_cpu.dim() == 2:
+                face_np = face_cpu.numpy()
+            else:
+                face_np = None
+
+            if face_np is not None and face_np.size > 0:
+                if face_np.max() <= 1.0:
+                    face_np = (face_np * 255).astype(np.uint8)
+                else:
+                    face_np = face_np.astype(np.uint8)
+
+                save_name = f"{current_fname}_face{i}.png"
+                save_path = os.path.join(SAVE_DEBUG_DIR, save_name)
+                
+                if face_np.ndim == 3 and face_np.shape[2] == 3:
+                    cv2.imwrite(save_path, face_np[:, :, ::-1]) 
+                else:
+                    cv2.imwrite(save_path, face_np)
+
+        except Exception as e:
+            pass
+
+        transform_resize = Resize(self.image_size)
+        face_tensor = transform_resize(face_tensor) / 255
+        if concat_batch is None:
+            concat_batch = face_tensor
+        else:
+            concat_batch = torch.cat((concat_batch, face_tensor), 0)
+
+    return concat_batch
+
+
+# ==========================================
+# 2. 폴더 내 이미지 직접 분석 함수
+# ==========================================
+def run_folder_analysis(image_base_path, chain, emotion_classes):
+    
+    valid_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+    # 폴더 내 파일 확인
+    if not os.path.exists(image_base_path):
+        print(f"경로 없음: {image_base_path}")
+        return pd.DataFrame()
+
+    image_files = [f for f in os.listdir(image_base_path) if os.path.splitext(f)[1].lower() in valid_extensions]
+    image_files.sort() 
+
+    print(f"총 {len(image_files)}개의 이미지를 분석합니다.")
+
+    output_label_map = { 
+        0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 
+        4: 'sad', 5: 'surprise', 6: 'neutral'
+    }
+
+    results_data = []
+
+    # 함수 교체 (이미지 crop 저장용)
+    model_instance = chain.au_agent.detector.emotion_model
+    # model_instance._batch_make = types.MethodType(custom_batch_make, model_instance) #이거 끄면 이미지 저장 X
+
+    for filename in tqdm(image_files, desc="Analyzing Images"):
+        img_full_path = os.path.join(image_base_path, filename)
+        
+        chain.au_agent.detector.emotion_model.current_filename = filename
+
+        input_image = cv2.imread(img_full_path)
+
+        # -----------------------------------------------------------
+        # [중요] 기본값을 'False' / 'unknown'으로 미리 설정
+        # 얼굴이 없으면 이 값이 그대로 저장됨
+        # -----------------------------------------------------------
+        analysis_res = {
+            "filename": filename,
+            "img_width": 0,
+            "img_height": 0,
+            "is_detected": False,
+            "count_faces": 0,
+            
+            "esti_expression": "unknown", 
+            "esti_score": 0.0,
+
+            "angry": 0.0, "disgust": 0.0, "fear": 0.0, 
+            "happy": 0.0, "sad": 0.0, "surprise": 0.0, "neutral": 0.0
+        }
+
+        if input_image is not None:
+            h, w = input_image.shape[:2]
+            analysis_res["img_width"] = w
+            analysis_res["img_height"] = h
+
+            image_rgb = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
+            
+            # 얼굴 검출 시도
+            _, _, faces, _, emotions, _ = chain.au_agent.run(image_rgb, ndarray_to_list=False)
+
+            # 얼굴 있음! -> 데이터 채워넣기
+            if faces is not None and len(faces) > 0 and len(faces[0]) > 0:
+                if isinstance(faces[0][0], (list, np.ndarray)):
+                    actual_faces = faces[0]
+                else:
+                    actual_faces = faces
+                
+                if len(actual_faces) > 0 and len(actual_faces[0]) >= 5:
+                    analysis_res["is_detected"] = True  # True로 변경
+                    analysis_res["count_faces"] = len(actual_faces)
+                    
+                    # 감정 분석 (detect 된 경우에만 수행)
+                    if emotions is not None and len(emotions) > 0:
+                        probs = emotions
+                        while isinstance(probs, (list, np.ndarray)) and len(probs) > 0 and isinstance(probs[0], (list, np.ndarray)):
+                            probs = probs[0]
+                        
+                        if isinstance(probs, (list, np.ndarray)) and len(probs) > 0:
+                            dom_emotion_name, dom_score = get_dominant_emotion(probs, emotion_classes)
+                            
+                            if dom_emotion_name in emotion_classes:
+                                expr_idx = emotion_classes.index(dom_emotion_name)
+                                analysis_res["esti_expression"] = output_label_map.get(expr_idx, "unknown")
+                                analysis_res["esti_score"] = round(float(dom_score), 3)
+
+                                analysis_res["esti_angry"] = round(float(probs[0]), 3)
+                                analysis_res["esti_disgust"] = round(float(probs[1]), 3)
+                                analysis_res["esti_fear"] = round(float(probs[2]), 3)
+                                analysis_res["esti_happy"] = round(float(probs[3]), 3)
+                                analysis_res["esti_sad"] = round(float(probs[4]), 3)
+                                analysis_res["esti_surprise"] = round(float(probs[5]), 3)
+                                analysis_res["esti_neutral"] = round(float(probs[6]), 3)
+
+        # [핵심] Detect 여부와 상관없이 무조건 리스트에 추가
+        results_data.append(analysis_res)
+
+    return pd.DataFrame(results_data)
+
+
+# ==========================================
+# 3. 메인 실행부
+# ==========================================
+if __name__ == "__main__":
+    # 1. 분석할 이미지가 들어있는 폴더
+    IMAGE_BASE_PATH = "/home/technonia/intern/dmaps_data_capture_img"
+    
+    # 2. 결과 저장할 CSV 파일명
+    OUTPUT_CSV_PATH = "0121_dmaps_old_result.csv"
+
+    chain = ValenceArousalImageChain()
+    emotion_classes = chain.au_agent.emotion_labels
+
+    if os.path.exists(IMAGE_BASE_PATH):
+        df_final = run_folder_analysis(IMAGE_BASE_PATH, chain, emotion_classes)
+        
+        df_final.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8-sig', float_format='%.3f')
+        
+        print("\n" + "="*50)
+        print(f"분석 완료! 총 {len(df_final)}개의 파일 처리됨.")
+        
+        detected_count = df_final['is_detected'].sum()
+        not_detected_count = len(df_final) - detected_count
+
+        print(f"얼굴 검출 성공: {detected_count}")
+        print(f"얼굴 미검출 (False 저장됨): {not_detected_count}")
+        
+        if detected_count > 0:
+            print("\n[감정 분포 (검출된 데이터만)]")
+            print(df_final[df_final['is_detected']==True]['esti_expression'].value_counts())
+        
+        print(f"결과 파일 저장됨: {OUTPUT_CSV_PATH}")
+        print("="*50)
+
+    else:
+        print(f"에러: 폴더를 찾을 수 없습니다 -> {IMAGE_BASE_PATH}")
