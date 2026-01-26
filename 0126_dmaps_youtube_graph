@@ -1,0 +1,375 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+def extract_frame_number(filename):
+    """
+    파일명에서 프레임 번호 추출
+    예: '19-23736372_open1-1_0000.jpg' -> 0
+        '19-23736372_open1-1_0001.jpg' -> 1
+    """
+    try:
+        name_without_ext = os.path.splitext(filename)[0]
+        frame_num = int(name_without_ext.split('_')[-1])
+        return frame_num
+    except:
+        return -1
+
+def get_dominant_emotion(row, emotion_cols):
+    """
+    가장 높은 확률의 감정 찾기
+    """
+    emotions = {col: row[col] for col in emotion_cols}
+    dominant = max(emotions, key=emotions.get)
+    return dominant
+
+
+def plot_emotion_analysis(csv_modelpt, csv_new, output_path="emotion_analysis.png"):
+    """
+    하나의 PNG에 5개 그래프 생성:
+    
+    [감정 변이 그래프 - 2개]
+    1. model.pt (CAGE) 감정 확률 변화
+    2. PyFeat (New) 감정 확률 변화
+    
+    [Valence & Arousal - 1개]
+    3. CAGE Valence & Arousal
+    
+    [대표 감정 그래프 - 2개]
+    4. model.pt 대표 감정 (세로 막대)
+       - 막대 높이: CAGE의 intensity (valence/arousal 기반)
+       - 막대 색상: model.pt의 대표 감정
+    5. PyFeat New 대표 감정 (세로 막대)
+       - 막대 높이: CAGE의 intensity (valence/arousal 기반) ← 4번과 동일!
+       - 막대 색상: PyFeat New의 대표 감정
+    
+    Args:
+        csv_modelpt: model.pt (CAGE) 결과 CSV 경로
+        csv_new: PyFeat new 버전 CSV 경로
+        output_path: 저장할 그래프 경로
+    """
+    print("\n" + "="*60)
+    print("감정 분석 그래프 생성 시작")
+    print("="*60)
+    
+    # CSV 파일 읽기
+    df_modelpt = pd.read_csv(csv_modelpt)
+    df_new = pd.read_csv(csv_new)
+    
+    # 프레임 번호 추출
+    df_modelpt['frame_num'] = df_modelpt['filename'].apply(extract_frame_number)
+    df_new['frame_num'] = df_new['filename'].apply(extract_frame_number)
+    
+    # 프레임 번호로 정렬
+    df_modelpt = df_modelpt.sort_values('frame_num')
+    df_new = df_new.sort_values('frame_num')
+    
+    # 감정 컬럼들
+    emotion_cols = ['esti_angry', 'esti_disgust', 'esti_fear', 'esti_happy', 
+                    'esti_sad', 'esti_surprise', 'esti_neutral']
+    
+    # 감정별 색상 설정
+    emotion_colors = {
+        'esti_angry': '#FF5252',      # 빨강
+        'esti_disgust': '#AB47BC',    # 보라
+        'esti_fear': '#7B1FA2',       # 진한 보라
+        'esti_happy': '#FFD54F',      # 노랑
+        'esti_sad': '#42A5F5',        # 파랑
+        'esti_surprise': '#FFA726',   # 주황
+        'esti_neutral': '#BDBDBD'     # 회색
+    }
+    
+    # 감정 라벨
+    emotion_labels = {
+        'esti_angry': 'Angry',
+        'esti_disgust': 'Disgust',
+        'esti_fear': 'Fear',
+        'esti_happy': 'Happy',
+        'esti_sad': 'Sad',
+        'esti_surprise': 'Surprise',
+        'esti_neutral': 'Neutral'
+    }
+    
+    # ============================================================
+    # 하나의 figure에 5개 subplot 생성
+    # ============================================================
+    fig = plt.figure(figsize=(16, 20))
+    
+    # GridSpec으로 레이아웃 설정
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(5, 1, figure=fig, hspace=0.4)
+    
+    ax1 = fig.add_subplot(gs[0])  # 감정 변이 1 (model.pt)
+    ax2 = fig.add_subplot(gs[1])  # 감정 변이 2 (PyFeat New)
+    ax3 = fig.add_subplot(gs[2])  # Valence & Arousal
+    ax4 = fig.add_subplot(gs[3])  # 대표 감정 1 (model.pt)
+    ax5 = fig.add_subplot(gs[4])  # 대표 감정 2 (PyFeat New)
+    
+    # ============================================================
+    # 1-2. 감정 변이 그래프 (Emotion Variation Graph)
+    # ============================================================
+    print("\n[1/3] 감정 변이 그래프 생성 중...")
+    
+    # 공통 y축 범위 계산 (model.pt 기준)
+    all_emotion_data = []
+    for emotion in emotion_cols:
+        emotion_data = df_modelpt[emotion].copy()
+        emotion_data[df_modelpt['is_detected'] == False] = np.nan
+        all_emotion_data.append(emotion_data)
+    
+    all_values = pd.concat(all_emotion_data)
+    valid_values = all_values.dropna()
+    
+    if len(valid_values) > 0:
+        data_min = valid_values.min()
+        data_max = valid_values.max()
+        margin = (data_max - data_min) * 0.01
+        shared_y_min = max(0, data_min - margin)
+        shared_y_max = min(1, data_max + margin)
+        
+        if (shared_y_max - shared_y_min) < 0.15:
+            center = (shared_y_max + shared_y_min) / 2
+            shared_y_min = max(0, center - 0.075)
+            shared_y_max = min(1, center + 0.075)
+        
+        print(f"  ✓ 공통 y축 범위: [{shared_y_min:.3f}, {shared_y_max:.3f}]")
+    else:
+        shared_y_min, shared_y_max = 0, 1
+    
+    # 감정 변이 그래프 그리기
+    variation_datasets = [
+        (df_modelpt, 'model.pt (CAGE) - Emotion Variation', ax1),
+        (df_new, 'PyFeat (New) - Emotion Variation', ax2)
+    ]
+    
+    for df, title, ax in variation_datasets:
+        for emotion in emotion_cols:
+            emotion_data = df[emotion].copy()
+            emotion_data[df['is_detected'] == False] = np.nan
+            
+            ax.plot(df['frame_num'], emotion_data, 
+                   color=emotion_colors[emotion],
+                   linewidth=1.5,
+                   alpha=0.6,
+                   label=emotion_labels[emotion])
+        
+        ax.set_title(title, fontsize=13, fontweight='bold', pad=8)
+        ax.set_xlabel('Frame Number', fontsize=11)
+        ax.set_ylabel('Emotion Probability', fontsize=11)
+        ax.set_ylim(shared_y_min, shared_y_max)
+        
+        if len(df) > 0:
+            min_frame = df['frame_num'].min()
+            max_frame = df['frame_num'].max()
+            ax.set_xlim(min_frame - 1, max_frame + 1)
+            
+            major_ticks = np.arange(0, max_frame + 1, 10)
+            ax.set_xticks(major_ticks)
+            minor_ticks = np.arange(0, max_frame + 1, 5)
+            ax.set_xticks(minor_ticks, minor=True)
+            
+            ax.grid(which='major', alpha=0.4, linestyle='-', linewidth=0.8)
+            ax.grid(which='minor', alpha=0.2, linestyle=':', linewidth=0.5)
+            ax.tick_params(axis='x', rotation=45, labelsize=9)
+        
+        # 범례 추가
+        ax.legend(loc='upper right', ncol=4, fontsize=8, framealpha=0.9)
+        
+        # y축 눈금
+        y_range = shared_y_max - shared_y_min
+        if y_range < 0.2:
+            tick_interval = 0.02
+        elif y_range < 0.3:
+            tick_interval = 0.05
+        elif y_range < 0.6:
+            tick_interval = 0.1
+        else:
+            tick_interval = 0.2
+        
+        major_yticks = np.arange(
+            np.floor(shared_y_min / tick_interval) * tick_interval,
+            np.ceil(shared_y_max / tick_interval) * tick_interval + tick_interval,
+            tick_interval
+        )
+        ax.set_yticks(major_yticks)
+    
+    # ============================================================
+    # 3. Valence & Arousal 그래프
+    # ============================================================
+    print("\n[2/3] Valence & Arousal 그래프 생성 중...")
+    
+    if 'cage_valence' in df_modelpt.columns and 'cage_arousal' in df_modelpt.columns:
+        valence_data = df_modelpt['cage_valence'].copy()
+        arousal_data = df_modelpt['cage_arousal'].copy()
+        
+        valence_data[df_modelpt['is_detected'] == False] = np.nan
+        arousal_data[df_modelpt['is_detected'] == False] = np.nan
+        
+        valence_valid = valence_data.dropna()
+        arousal_valid = arousal_data.dropna()
+        
+        if len(valence_valid) > 0 and len(arousal_valid) > 0:
+            all_min = min(valence_valid.min(), arousal_valid.min())
+            all_max = max(valence_valid.max(), arousal_valid.max())
+            
+            margin = (all_max - all_min) * 0.2
+            y_min = all_min - margin
+            y_max = all_max + margin
+            
+            if (y_max - y_min) < 0.6:
+                center = (y_max + y_min) / 2
+                y_min = center - 0.3
+                y_max = center + 0.3
+            
+            y_min = max(y_min, -1.0)
+            y_max = min(y_max, 1.0)
+            
+            print(f"  ✓ Valence/Arousal y축 범위: [{y_min:.3f}, {y_max:.3f}]")
+        else:
+            y_min, y_max = -1.0, 1.0
+        
+        ax3.plot(df_modelpt['frame_num'], valence_data,
+                color='#4CAF50', linewidth=2, alpha=0.8, label='Valence')
+        ax3.plot(df_modelpt['frame_num'], arousal_data,
+                color='#F44336', linewidth=2, alpha=0.8, label='Arousal')
+        
+        if y_min <= 0 <= y_max:
+            ax3.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        
+        ax3.set_title('Valence & Arousal (CAGE)', fontsize=13, fontweight='bold', pad=8)
+        ax3.set_xlabel('Frame Number', fontsize=11)
+        ax3.set_ylabel('Value', fontsize=11)
+        ax3.set_ylim(y_min, y_max)
+        
+        if len(df_modelpt) > 0:
+            min_frame = df_modelpt['frame_num'].min()
+            max_frame = df_modelpt['frame_num'].max()
+            ax3.set_xlim(min_frame - 1, max_frame + 1)
+            
+            major_ticks = np.arange(0, max_frame + 1, 10)
+            ax3.set_xticks(major_ticks)
+            minor_ticks = np.arange(0, max_frame + 1, 5)
+            ax3.set_xticks(minor_ticks, minor=True)
+            
+            ax3.grid(which='major', alpha=0.4, linestyle='-', linewidth=0.8)
+            ax3.grid(which='minor', alpha=0.2, linestyle=':', linewidth=0.5)
+            ax3.tick_params(axis='x', rotation=45, labelsize=9)
+        
+        ax3.legend(loc='upper right', fontsize=10, frameon=True)
+    
+    # ============================================================
+    # 4-5. 대표 감정 그래프 (Dominant Emotion Graph)
+    # ============================================================
+    print("\n[3/3] 대표 감정 그래프 생성 중...")
+    
+    # ★★★ 최적화: CSV에 intensity가 있으면 사용, 없으면 계산 ★★★
+    if 'intensity' in df_modelpt.columns:
+        print("  ✓ CSV에서 intensity 불러옴")
+        # NaN이 아닌 값들의 통계 출력
+        intensity_valid = df_modelpt['intensity'].dropna()
+        if len(intensity_valid) > 0:
+            print(f"    - model.pt intensity 범위: [{intensity_valid.min():.3f}, {intensity_valid.max():.3f}]")
+            print(f"    - model.pt intensity 평균: {intensity_valid.mean():.3f}")
+    elif 'cage_valence' in df_modelpt.columns and 'cage_arousal' in df_modelpt.columns:
+        print("  ✓ Intensity 계산 중 (sqrt(valence² + arousal²))...")
+        df_modelpt['intensity'] = df_modelpt.apply(
+            lambda row: calculate_emotion_intensity(row['cage_valence'], row['cage_arousal'])
+            if row['is_detected'] else np.nan,
+            axis=1
+        )
+        intensity_valid = df_modelpt['intensity'].dropna()
+        if len(intensity_valid) > 0:
+            print(f"    - model.pt intensity 범위: [{intensity_valid.min():.3f}, {intensity_valid.max():.3f}]")
+            print(f"    - model.pt intensity 평균: {intensity_valid.mean():.3f}")
+    else:
+        df_modelpt['intensity'] = np.nan
+        print("    ⚠️ CAGE valence/arousal 없음")
+    
+    # ★★★ PyFeat New에 intensity 매핑 (frame_num 기준) ★★★
+    print("  ✓ PyFeat New에 intensity 매핑 중 (frame_num 기준)...")
+    intensity_map = df_modelpt.set_index('frame_num')['intensity']
+    df_new['intensity'] = df_new['frame_num'].map(intensity_map)
+    
+    # 매칭 확인
+    matched_count = df_new['intensity'].notna().sum()
+    total_count = len(df_new)
+    print(f"    - 매칭 성공: {matched_count}/{total_count} frames")
+    if matched_count < total_count:
+        print(f"    ⚠️ {total_count - matched_count}개 프레임의 intensity가 매칭되지 않음")
+    
+    # 대표 감정 찾기 (각자의 CSV에서)
+    print("  ✓ 대표 감정 찾기...")
+    df_modelpt['dominant_emotion'] = df_modelpt.apply(
+        lambda row: get_dominant_emotion(row, emotion_cols) if row['is_detected'] else 'esti_neutral',
+        axis=1
+    )
+    df_new['dominant_emotion'] = df_new.apply(
+        lambda row: get_dominant_emotion(row, emotion_cols) if row['is_detected'] else 'esti_neutral',
+        axis=1
+    )
+    
+    modelpt_emotions = df_modelpt['dominant_emotion'].value_counts()
+    new_emotions = df_new['dominant_emotion'].value_counts()
+    print(f"    - model.pt 대표 감정 분포: {dict(modelpt_emotions)}")
+    print(f"    - PyFeat New 대표 감정 분포: {dict(new_emotions)}")
+    
+    dominant_datasets = [
+            (df_modelpt, 'CAGE model.pt sqrt(V²+A²) emotion', ax4),
+            (df_new, 'pyfeat new sqrt(V²+A²) emotion', ax5)
+    ]
+    
+    for df, title, ax in dominant_datasets:
+        if len(df) > 0:
+            for idx, row in df.iterrows():
+                if pd.notna(row['intensity']):
+                    color = emotion_colors[row['dominant_emotion']]
+                    ax.bar(row['frame_num'], row['intensity'], 
+                          width=0.9,
+                          color=color, 
+                          alpha=0.85,
+                          edgecolor='none')
+            
+            ax.set_title(title, fontsize=13, fontweight='bold', pad=8)
+            ax.set_xlabel('Frame Number', fontsize=11)
+            ax.set_ylabel('(sqrt(V²+A²)', fontsize=11)
+            
+            min_frame = df['frame_num'].min()
+            max_frame = df['frame_num'].max()
+            ax.set_xlim(min_frame - 1, max_frame + 1)
+            
+            # y축은 0부터 시작
+            max_intensity = df['intensity'].max()
+            if pd.notna(max_intensity):
+                ax.set_ylim(0, max_intensity * 1.1)
+            
+            major_ticks = np.arange(0, max_frame + 1, 10)
+            ax.set_xticks(major_ticks)
+            minor_ticks = np.arange(0, max_frame + 1, 5)
+            ax.set_xticks(minor_ticks, minor=True)
+            
+            ax.grid(which='major', alpha=0.4, linestyle='-', linewidth=0.8, axis='y')
+            ax.grid(which='minor', alpha=0.2, linestyle=':', linewidth=0.5, axis='y')
+            ax.tick_params(axis='x', rotation=45, labelsize=9)
+            
+            legend_handles = [plt.Rectangle((0,0),1,1, color=emotion_colors[col], alpha=0.7, label=emotion_labels[col]) 
+                            for col in emotion_cols]
+            ax.legend(handles=legend_handles, loc='upper right', ncol=4, fontsize=8, framealpha=0.9)
+    
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    
+    print("\n" + "="*60)
+    print("✅ 그래프 생성 완료!")
+    
+    plt.close()
+
+
+if __name__ == "__main__":
+    CSV_MODELPT = "/home/technonia/intern/faceinsight/0126_youtube_csv/0126_dmaps_model_youtube5.csv"
+    CSV_NEW = "/home/technonia/intern/faceinsight/0126_youtube_csv/0126_dmaps_pyfeat_new_youtube5.csv"
+    
+    plot_emotion_analysis(CSV_MODELPT, CSV_NEW, output_path="0126_youtube5.png")
+    
+    print("\n완료!")
