@@ -253,7 +253,7 @@ def plot_emotion_analysis(csv_new, output_path="emotion_analysis.png"):
     
     # 대표 감정 찾기
     df_new['dominant_emotion'] = df_new.apply(
-        lambda row: get_dominant_emotion(row, emotion_cols) if row['is_detected'] else 'esti_neutral',
+        lambda row: get_dominant_emotion(row, emotion_cols) if row['is_detected'] else 'None',
         axis=1
     )
     
